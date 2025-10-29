@@ -2,7 +2,7 @@
 const CONFIG = {
   DEBUG: true, // Set to false to disable debug logging
   CACHE_TTL: 5 * 60 * 1000, // 5 minutes
-  DEBOUNCE_DELAY: 500, // ms
+  DEBOUNCE_DELAY: 1000, // ms - increased to prevent rapid-fire calls
   MAX_RETRIES: 3,
   RETRY_DELAY: 1000, // ms
   RATE_LIMIT_DELAY: 100, // ms between requests
@@ -17,6 +17,10 @@ let isProcessingQueue = false;
 
 // MutationObserver reference for cleanup
 let mutationObserver = null;
+
+// Processing flags to prevent concurrent execution
+let isProcessingSingleTaskView = false;
+let currentTaskId = null;
 
 // Debug logging function
 function debugLog(...args) {
@@ -278,31 +282,61 @@ async function addCreationDates(root = document) {
 
 async function addCreationDateSingleTaskView() {
   const singleTaskPanel = document.querySelector('[data-testid="task_view"]');
-  if (!singleTaskPanel) return false;
-
-  // Remove ALL existing creation date elements first to prevent duplicates
-  singleTaskPanel.querySelectorAll('.creation-date-single').forEach(el => {
-    el.remove();
-    debugLog('Removed existing creation-date-single element');
-  });
+  if (!singleTaskPanel) {
+    currentTaskId = null;
+    return false;
+  }
 
   const taskEl = singleTaskPanel.querySelector('[data-item-id], [data-id]');
-  if (!taskEl) return false;
+  if (!taskEl) {
+    currentTaskId = null;
+    return false;
+  }
 
   const taskId = taskEl.getAttribute('data-item-id') || taskEl.getAttribute('data-id');
-  if (!taskId) return false;
+  if (!taskId) {
+    currentTaskId = null;
+    return false;
+  }
+
+  // Prevent concurrent processing of the same task
+  if (isProcessingSingleTaskView && currentTaskId === taskId) {
+    debugLog(`Already processing single task view for ${taskId}, skipping`);
+    return true;
+  }
+
+  // If it's a different task, clean up the old one
+  if (currentTaskId !== taskId) {
+    debugLog(`New task detected: ${taskId} (previous: ${currentTaskId})`);
+    singleTaskPanel.querySelectorAll('.creation-date-single').forEach(el => {
+      el.remove();
+      debugLog('Removed creation-date-single from previous task');
+    });
+  }
+
+  isProcessingSingleTaskView = true;
+  currentTaskId = taskId;
 
   try {
     const taskData = await fetchTaskDetails(taskId);
     if (!taskData) {
       debugLog(`No data for single task view ${taskId}`);
+      isProcessingSingleTaskView = false;
       return false;
     }
 
     const creationDate = taskData.created_at || taskData.created;
     if (!creationDate) {
       debugLog(`No creation date for single task view ${taskId}`);
+      isProcessingSingleTaskView = false;
       return false;
+    }
+
+    // Check if we already added the date while fetching
+    if (singleTaskPanel.querySelector('.creation-date-single')) {
+      debugLog('Creation date already exists, skipping');
+      isProcessingSingleTaskView = false;
+      return true;
     }
 
     // More specific selector: find the Location label in the metadata section
@@ -312,6 +346,7 @@ async function addCreationDateSingleTaskView() {
 
     if (!locationLabel) {
       debugLog('Location label not found in single task view');
+      isProcessingSingleTaskView = false;
       return false;
     }
 
@@ -327,9 +362,11 @@ async function addCreationDateSingleTaskView() {
     locationLabel.insertAdjacentElement('afterend', dateEl);
     debugLog(`Added creation date to single task view ${taskId}`);
 
+    isProcessingSingleTaskView = false;
     return true;
   } catch (error) {
     debugLog(`Error in single task view:`, error);
+    isProcessingSingleTaskView = false;
     return false;
   }
 }
@@ -390,6 +427,14 @@ function createToggleButton(enabled) {
           debugLog('MutationObserver disconnected');
         }
 
+        // Reset processing flags
+        isProcessingSingleTaskView = false;
+        currentTaskId = null;
+
+        // Clear request queue
+        requestQueue = [];
+        isProcessingQueue = false;
+
         // Remove all creation date elements (including loading ones)
         document.querySelectorAll('.creation-date, .creation-date-single, .creation-date-loading').forEach(el => el.remove());
 
@@ -397,7 +442,7 @@ function createToggleButton(enabled) {
         const status = document.getElementById('todoist-extension-status');
         if (status) status.remove();
 
-        debugLog('Extension disabled - all elements removed');
+        debugLog('Extension disabled - all elements removed and flags reset');
       }
     });
   };
@@ -455,7 +500,14 @@ async function runExtension() {
   }
 
   // Debounced handler for mutations to avoid excessive calls
-  const debouncedHandler = debounce((mutations) => {
+  const debouncedHandler = debounce(async (mutations) => {
+    // Double-check extension is still enabled
+    const data = await new Promise((resolve) => chrome.storage.sync.get({ enabled: true }, resolve));
+    if (!data.enabled) {
+      debugLog('Extension disabled during mutation processing, skipping');
+      return;
+    }
+
     debugLog(`Processing ${mutations.length} mutations`);
     const nodesToProcess = new Set();
 
