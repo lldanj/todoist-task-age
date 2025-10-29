@@ -215,6 +215,12 @@ function showError(message) {
 async function addCreationDateToTask(taskEl) {
   if (taskEl.querySelector('.creation-date')) return;
 
+  // Skip if this is inside a single task view panel
+  if (taskEl.closest('[data-testid="task_view"]')) {
+    debugLog('Skipping task inside single task view');
+    return;
+  }
+
   const taskId = taskEl.getAttribute('data-item-id') || taskEl.getAttribute('data-id');
   if (!taskId) return;
 
@@ -274,7 +280,11 @@ async function addCreationDateSingleTaskView() {
   const singleTaskPanel = document.querySelector('[data-testid="task_view"]');
   if (!singleTaskPanel) return false;
 
-  if (singleTaskPanel.querySelector('.creation-date-single')) return true;
+  // Remove ALL existing creation date elements first to prevent duplicates
+  singleTaskPanel.querySelectorAll('.creation-date-single').forEach(el => {
+    el.remove();
+    debugLog('Removed existing creation-date-single element');
+  });
 
   const taskEl = singleTaskPanel.querySelector('[data-item-id], [data-id]');
   if (!taskEl) return false;
@@ -295,8 +305,9 @@ async function addCreationDateSingleTaskView() {
       return false;
     }
 
+    // More specific selector: find the Location label in the metadata section
     const locationLabel = Array.from(singleTaskPanel.querySelectorAll('div, span')).find(
-      (el) => el.textContent.trim() === 'Location'
+      (el) => el.textContent.trim() === 'Location' && !el.querySelector('*')
     );
 
     if (!locationLabel) {
@@ -304,9 +315,7 @@ async function addCreationDateSingleTaskView() {
       return false;
     }
 
-    const existing = singleTaskPanel.querySelector('.creation-date-single');
-    if (existing) existing.remove();
-
+    // Create and add the date element
     const dateEl = document.createElement('div');
     dateEl.className = 'creation-date-single';
     dateEl.style.fontSize = '0.85em';
@@ -430,40 +439,46 @@ async function runExtension() {
 
   showRunningMessage();
 
-  const singleTaskAdded = await addCreationDateSingleTaskView();
+  // Try to add single task view first
+  await addCreationDateSingleTaskView();
 
-  if (!singleTaskAdded) {
-    debugLog('Adding creation dates to task list');
-    addCreationDates();
+  // Always set up the observer for task lists
+  debugLog('Adding creation dates to task list');
+  addCreationDates();
 
-    const taskListContainer = document.querySelector('[data-testid="task_list"]') || document.body;
+  const taskListContainer = document.querySelector('[data-testid="task_list"]') || document.body;
 
-    // Disconnect existing observer if any
-    if (mutationObserver) {
-      mutationObserver.disconnect();
-      debugLog('Disconnected previous MutationObserver');
-    }
+  // Disconnect existing observer if any
+  if (mutationObserver) {
+    mutationObserver.disconnect();
+    debugLog('Disconnected previous MutationObserver');
+  }
 
-    // Debounced handler for mutations to avoid excessive calls
-    const debouncedHandler = debounce((mutations) => {
-      debugLog(`Processing ${mutations.length} mutations`);
-      const nodesToProcess = new Set();
+  // Debounced handler for mutations to avoid excessive calls
+  const debouncedHandler = debounce((mutations) => {
+    debugLog(`Processing ${mutations.length} mutations`);
+    const nodesToProcess = new Set();
 
-      for (const mutation of mutations) {
-        for (const node of mutation.addedNodes) {
-          if (node.nodeType === 1) {
-            nodesToProcess.add(node);
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        if (node.nodeType === 1) {
+          nodesToProcess.add(node);
+
+          // Check if single task view appeared
+          if (node.querySelector && node.querySelector('[data-testid="task_view"]')) {
+            debugLog('Single task view detected in mutations');
+            addCreationDateSingleTaskView();
           }
         }
       }
+    }
 
-      nodesToProcess.forEach(node => addCreationDates(node));
-    }, CONFIG.DEBOUNCE_DELAY);
+    nodesToProcess.forEach(node => addCreationDates(node));
+  }, CONFIG.DEBOUNCE_DELAY);
 
-    mutationObserver = new MutationObserver(debouncedHandler);
-    mutationObserver.observe(taskListContainer, { childList: true, subtree: true });
-    debugLog('MutationObserver attached with debouncing');
-  }
+  mutationObserver = new MutationObserver(debouncedHandler);
+  mutationObserver.observe(taskListContainer, { childList: true, subtree: true });
+  debugLog('MutationObserver attached with debouncing');
 
   debugLog('Extension initialized successfully');
 }
