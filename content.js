@@ -1,4 +1,26 @@
-const API_TOKEN = "a24425f7ede6b9c983c028616b55f62240bf7021";
+// Configuration
+const CONFIG = {
+  DEBUG: true, // Set to false to disable debug logging
+  CACHE_TTL: 5 * 60 * 1000, // 5 minutes
+  DEBOUNCE_DELAY: 500, // ms
+  MAX_RETRIES: 3,
+  RETRY_DELAY: 1000, // ms
+  RATE_LIMIT_DELAY: 100, // ms between requests
+};
+
+// In-memory cache for task data
+const taskCache = new Map();
+
+// Request queue for rate limiting
+let requestQueue = [];
+let isProcessingQueue = false;
+
+// Debug logging function
+function debugLog(...args) {
+  if (CONFIG.DEBUG) {
+    console.log('[Todoist Extension]', ...args);
+  }
+}
 
 function timeAgo(dateString) {
   const now = new Date();
@@ -16,12 +38,175 @@ function timeAgo(dateString) {
   return `Created just now`;
 }
 
-async function fetchTaskDetails(taskId) {
-  const response = await fetch(`https://api.todoist.com/rest/v2/tasks/${taskId}`, {
-    headers: { Authorization: `Bearer ${API_TOKEN}` },
+// Get API token from storage
+async function getApiToken() {
+  return new Promise((resolve) => {
+    chrome.storage.sync.get({ apiToken: '' }, (data) => {
+      resolve(data.apiToken);
+    });
   });
-  if (!response.ok) return null;
-  return response.json();
+}
+
+// Cache management
+function getCachedTask(taskId) {
+  const cached = taskCache.get(taskId);
+  if (!cached) return null;
+
+  const now = Date.now();
+  if (now - cached.timestamp > CONFIG.CACHE_TTL) {
+    taskCache.delete(taskId);
+    debugLog(`Cache expired for task ${taskId}`);
+    return null;
+  }
+
+  debugLog(`Cache hit for task ${taskId}`);
+  return cached.data;
+}
+
+function setCachedTask(taskId, data) {
+  taskCache.set(taskId, {
+    data,
+    timestamp: Date.now(),
+  });
+  debugLog(`Cached task ${taskId}`);
+}
+
+// Retry logic with exponential backoff
+async function fetchWithRetry(url, options, retries = CONFIG.MAX_RETRIES) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      debugLog(`Fetching ${url} (attempt ${i + 1}/${retries})`);
+      const response = await fetch(url, options);
+
+      if (response.ok) {
+        return response;
+      }
+
+      if (response.status === 401) {
+        debugLog('Authentication failed - invalid API token');
+        showError('Invalid API token. Please check your settings.');
+        return null;
+      }
+
+      if (response.status === 429) {
+        debugLog('Rate limited, waiting before retry...');
+        await sleep(CONFIG.RETRY_DELAY * Math.pow(2, i));
+        continue;
+      }
+
+      if (response.status >= 500) {
+        debugLog(`Server error ${response.status}, retrying...`);
+        await sleep(CONFIG.RETRY_DELAY * Math.pow(2, i));
+        continue;
+      }
+
+      debugLog(`Request failed with status ${response.status}`);
+      return response;
+    } catch (error) {
+      debugLog(`Request error: ${error.message}`);
+      if (i === retries - 1) {
+        showError(`Network error: ${error.message}`);
+        return null;
+      }
+      await sleep(CONFIG.RETRY_DELAY * Math.pow(2, i));
+    }
+  }
+  return null;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Rate-limited request queue
+async function processRequestQueue() {
+  if (isProcessingQueue || requestQueue.length === 0) return;
+
+  isProcessingQueue = true;
+  debugLog(`Processing request queue (${requestQueue.length} requests)`);
+
+  while (requestQueue.length > 0) {
+    const { taskId, resolve, reject } = requestQueue.shift();
+
+    try {
+      const token = await getApiToken();
+      if (!token) {
+        debugLog('No API token found');
+        showError('Please configure your API token in extension settings');
+        resolve(null);
+        continue;
+      }
+
+      const response = await fetchWithRetry(
+        `https://api.todoist.com/rest/v2/tasks/${taskId}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      if (response && response.ok) {
+        const data = await response.json();
+        setCachedTask(taskId, data);
+        resolve(data);
+      } else {
+        resolve(null);
+      }
+    } catch (error) {
+      debugLog(`Error fetching task ${taskId}:`, error);
+      reject(error);
+    }
+
+    // Rate limiting delay
+    if (requestQueue.length > 0) {
+      await sleep(CONFIG.RATE_LIMIT_DELAY);
+    }
+  }
+
+  isProcessingQueue = false;
+  debugLog('Request queue processed');
+}
+
+async function fetchTaskDetails(taskId) {
+  // Check cache first
+  const cached = getCachedTask(taskId);
+  if (cached) {
+    return cached;
+  }
+
+  // Add to queue and process
+  return new Promise((resolve, reject) => {
+    requestQueue.push({ taskId, resolve, reject });
+    processRequestQueue();
+  });
+}
+
+// Error notification system
+function showError(message) {
+  const existingError = document.getElementById('todoist-extension-error');
+  if (existingError) existingError.remove();
+
+  const errorDiv = document.createElement('div');
+  errorDiv.id = 'todoist-extension-error';
+  errorDiv.textContent = message;
+  Object.assign(errorDiv.style, {
+    position: 'fixed',
+    top: '10px',
+    right: '10px',
+    background: '#f44336',
+    color: '#fff',
+    padding: '10px 15px',
+    borderRadius: '4px',
+    fontSize: '13px',
+    zIndex: '10001',
+    maxWidth: '300px',
+    boxShadow: '0 2px 5px rgba(0,0,0,0.2)',
+  });
+
+  document.body.appendChild(errorDiv);
+
+  setTimeout(() => {
+    errorDiv.style.opacity = '0';
+    errorDiv.style.transition = 'opacity 0.3s';
+    setTimeout(() => errorDiv.remove(), 300);
+  }, 5000);
 }
 
 async function addCreationDateToTask(taskEl) {
@@ -30,22 +215,49 @@ async function addCreationDateToTask(taskEl) {
   const taskId = taskEl.getAttribute('data-item-id') || taskEl.getAttribute('data-id');
   if (!taskId) return;
 
-  const taskData = await fetchTaskDetails(taskId);
-  if (!taskData) return;
+  // Add loading indicator
+  const loadingEl = document.createElement('div');
+  loadingEl.className = 'creation-date creation-date-loading';
+  loadingEl.style.fontSize = '0.85em';
+  loadingEl.style.color = '#999';
+  loadingEl.style.marginTop = '0px';
+  loadingEl.style.marginLeft = '30px';
+  loadingEl.style.marginBottom = '10px';
+  loadingEl.textContent = 'Loading...';
+  taskEl.appendChild(loadingEl);
 
-  const creationDate = taskData.created_at || taskData.created;
-  if (!creationDate) return;
+  try {
+    const taskData = await fetchTaskDetails(taskId);
 
-  const dateEl = document.createElement('div');
-  dateEl.className = 'creation-date';
-  dateEl.style.fontSize = '0.85em';
-  dateEl.style.color = '#c9a46b';
-  dateEl.style.marginTop = '0px';
-  dateEl.style.marginLeft = '30px';
-  dateEl.style.marginBottom = '10px';
-  dateEl.textContent = timeAgo(creationDate);
+    // Remove loading indicator
+    loadingEl.remove();
 
-  taskEl.appendChild(dateEl);
+    if (!taskData) {
+      debugLog(`No data received for task ${taskId}`);
+      return;
+    }
+
+    const creationDate = taskData.created_at || taskData.created;
+    if (!creationDate) {
+      debugLog(`No creation date found for task ${taskId}`);
+      return;
+    }
+
+    const dateEl = document.createElement('div');
+    dateEl.className = 'creation-date';
+    dateEl.style.fontSize = '0.85em';
+    dateEl.style.color = '#c9a46b';
+    dateEl.style.marginTop = '0px';
+    dateEl.style.marginLeft = '30px';
+    dateEl.style.marginBottom = '10px';
+    dateEl.textContent = timeAgo(creationDate);
+
+    taskEl.appendChild(dateEl);
+    debugLog(`Added creation date to task ${taskId}`);
+  } catch (error) {
+    loadingEl.remove();
+    debugLog(`Error adding creation date to task ${taskId}:`, error);
+  }
 }
 
 async function addCreationDates(root = document) {
@@ -67,32 +279,47 @@ async function addCreationDateSingleTaskView() {
   const taskId = taskEl.getAttribute('data-item-id') || taskEl.getAttribute('data-id');
   if (!taskId) return false;
 
-  const taskData = await fetchTaskDetails(taskId);
-  if (!taskData) return false;
+  try {
+    const taskData = await fetchTaskDetails(taskId);
+    if (!taskData) {
+      debugLog(`No data for single task view ${taskId}`);
+      return false;
+    }
 
-  const creationDate = taskData.created_at || taskData.created;
-  if (!creationDate) return false;
+    const creationDate = taskData.created_at || taskData.created;
+    if (!creationDate) {
+      debugLog(`No creation date for single task view ${taskId}`);
+      return false;
+    }
 
-  const locationLabel = Array.from(singleTaskPanel.querySelectorAll('div, span')).find(
-    (el) => el.textContent.trim() === 'Location'
-  );
+    const locationLabel = Array.from(singleTaskPanel.querySelectorAll('div, span')).find(
+      (el) => el.textContent.trim() === 'Location'
+    );
 
-  if (!locationLabel) return false;
+    if (!locationLabel) {
+      debugLog('Location label not found in single task view');
+      return false;
+    }
 
-  const existing = singleTaskPanel.querySelector('.creation-date-single');
-  if (existing) existing.remove();
+    const existing = singleTaskPanel.querySelector('.creation-date-single');
+    if (existing) existing.remove();
 
-  const dateEl = document.createElement('div');
-  dateEl.className = 'creation-date-single';
-  dateEl.style.fontSize = '0.85em';
-  dateEl.style.color = '#666';
-  dateEl.style.marginTop = '4px';
-  dateEl.style.marginLeft = '20px';
-  dateEl.textContent = timeAgo(creationDate);
+    const dateEl = document.createElement('div');
+    dateEl.className = 'creation-date-single';
+    dateEl.style.fontSize = '0.85em';
+    dateEl.style.color = '#666';
+    dateEl.style.marginTop = '4px';
+    dateEl.style.marginLeft = '20px';
+    dateEl.textContent = timeAgo(creationDate);
 
-  locationLabel.insertAdjacentElement('afterend', dateEl);
+    locationLabel.insertAdjacentElement('afterend', dateEl);
+    debugLog(`Added creation date to single task view ${taskId}`);
 
-  return true;
+    return true;
+  } catch (error) {
+    debugLog(`Error in single task view:`, error);
+    return false;
+  }
 }
 
 function showRunningMessage() {
@@ -154,11 +381,35 @@ function createToggleButton(enabled) {
   document.body.appendChild(btn);
 }
 
+// Debounce helper
+function debounce(func, wait) {
+  let timeout;
+  return function executedFunction(...args) {
+    const later = () => {
+      clearTimeout(timeout);
+      func(...args);
+    };
+    clearTimeout(timeout);
+    timeout = setTimeout(later, wait);
+  };
+}
+
 async function runExtension() {
+  debugLog('Starting extension...');
+
   const data = await new Promise((resolve) => chrome.storage.sync.get({ enabled: true }, resolve));
   if (!data.enabled) {
+    debugLog('Extension is disabled');
     const status = document.getElementById('todoist-extension-status');
     if (status) status.remove();
+    return;
+  }
+
+  // Check if API token is configured
+  const token = await getApiToken();
+  if (!token) {
+    debugLog('No API token configured');
+    showError('Please configure your API token in extension settings (right-click extension icon → Options)');
     return;
   }
 
@@ -167,20 +418,33 @@ async function runExtension() {
   const singleTaskAdded = await addCreationDateSingleTaskView();
 
   if (!singleTaskAdded) {
+    debugLog('Adding creation dates to task list');
     addCreationDates();
 
     const taskListContainer = document.querySelector('[data-testid="task_list"]') || document.body;
-    const observer = new MutationObserver((mutations) => {
+
+    // Debounced handler for mutations to avoid excessive calls
+    const debouncedHandler = debounce((mutations) => {
+      debugLog(`Processing ${mutations.length} mutations`);
+      const nodesToProcess = new Set();
+
       for (const mutation of mutations) {
         for (const node of mutation.addedNodes) {
           if (node.nodeType === 1) {
-            addCreationDates(node);
+            nodesToProcess.add(node);
           }
         }
       }
-    });
+
+      nodesToProcess.forEach(node => addCreationDates(node));
+    }, CONFIG.DEBOUNCE_DELAY);
+
+    const observer = new MutationObserver(debouncedHandler);
     observer.observe(taskListContainer, { childList: true, subtree: true });
+    debugLog('MutationObserver attached with debouncing');
   }
+
+  debugLog('Extension initialized successfully');
 }
 
 chrome.storage.sync.get({ enabled: true }, (data) => {
