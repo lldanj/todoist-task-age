@@ -228,14 +228,24 @@ async function addCreationDateToTask(taskEl) {
   const taskId = taskEl.getAttribute('data-item-id') || taskEl.getAttribute('data-id');
   if (!taskId) return;
 
-  // Add loading indicator
+  // Ensure the task element has relative positioning
+  const computedStyle = window.getComputedStyle(taskEl);
+  if (computedStyle.position === 'static') {
+    taskEl.style.position = 'relative';
+  }
+
+  // Add loading indicator - positioned absolutely on the right
   const loadingEl = document.createElement('div');
   loadingEl.className = 'creation-date creation-date-loading';
-  loadingEl.style.fontSize = '0.85em';
-  loadingEl.style.color = '#999';
-  loadingEl.style.marginTop = '0px';
-  loadingEl.style.marginLeft = '30px';
-  loadingEl.style.marginBottom = '10px';
+  Object.assign(loadingEl.style, {
+    position: 'absolute',
+    top: '8px',
+    right: '10px',
+    fontSize: '0.75em',
+    color: '#999',
+    pointerEvents: 'none',
+    zIndex: '10',
+  });
   loadingEl.textContent = 'Loading...';
   taskEl.appendChild(loadingEl);
 
@@ -258,11 +268,16 @@ async function addCreationDateToTask(taskEl) {
 
     const dateEl = document.createElement('div');
     dateEl.className = 'creation-date';
-    dateEl.style.fontSize = '0.85em';
-    dateEl.style.color = '#c9a46b';
-    dateEl.style.marginTop = '0px';
-    dateEl.style.marginLeft = '30px';
-    dateEl.style.marginBottom = '10px';
+    Object.assign(dateEl.style, {
+      position: 'absolute',
+      top: '8px',
+      right: '10px',
+      fontSize: '0.75em',
+      color: '#c9a46b',
+      pointerEvents: 'none',
+      zIndex: '10',
+      whiteSpace: 'nowrap',
+    });
     dateEl.textContent = timeAgo(creationDate);
 
     taskEl.appendChild(dateEl);
