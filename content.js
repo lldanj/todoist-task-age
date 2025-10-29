@@ -15,6 +15,9 @@ const taskCache = new Map();
 let requestQueue = [];
 let isProcessingQueue = false;
 
+// MutationObserver reference for cleanup
+let mutationObserver = null;
+
 // Debug logging function
 function debugLog(...args) {
   if (CONFIG.DEBUG) {
@@ -371,9 +374,21 @@ function createToggleButton(enabled) {
       if (newEnabled) {
         runExtension();
       } else {
-        document.querySelectorAll('.creation-date, .creation-date-single').forEach(el => el.remove());
+        // Disconnect the mutation observer to stop adding new dates
+        if (mutationObserver) {
+          mutationObserver.disconnect();
+          mutationObserver = null;
+          debugLog('MutationObserver disconnected');
+        }
+
+        // Remove all creation date elements (including loading ones)
+        document.querySelectorAll('.creation-date, .creation-date-single, .creation-date-loading').forEach(el => el.remove());
+
+        // Remove status message
         const status = document.getElementById('todoist-extension-status');
         if (status) status.remove();
+
+        debugLog('Extension disabled - all elements removed');
       }
     });
   };
@@ -423,6 +438,12 @@ async function runExtension() {
 
     const taskListContainer = document.querySelector('[data-testid="task_list"]') || document.body;
 
+    // Disconnect existing observer if any
+    if (mutationObserver) {
+      mutationObserver.disconnect();
+      debugLog('Disconnected previous MutationObserver');
+    }
+
     // Debounced handler for mutations to avoid excessive calls
     const debouncedHandler = debounce((mutations) => {
       debugLog(`Processing ${mutations.length} mutations`);
@@ -439,8 +460,8 @@ async function runExtension() {
       nodesToProcess.forEach(node => addCreationDates(node));
     }, CONFIG.DEBOUNCE_DELAY);
 
-    const observer = new MutationObserver(debouncedHandler);
-    observer.observe(taskListContainer, { childList: true, subtree: true });
+    mutationObserver = new MutationObserver(debouncedHandler);
+    mutationObserver.observe(taskListContainer, { childList: true, subtree: true });
     debugLog('MutationObserver attached with debouncing');
   }
 
