@@ -95,6 +95,11 @@ async function fetchWithRetry(url, options, retries = CONFIG.MAX_RETRIES) {
         return null;
       }
 
+      if (response.status === 404) {
+        debugLog(`Task not found (404) - likely deleted or invalid ID`);
+        return null;
+      }
+
       if (response.status === 429) {
         debugLog('Rate limited, waiting before retry...');
         await sleep(CONFIG.RETRY_DELAY * Math.pow(2, i));
